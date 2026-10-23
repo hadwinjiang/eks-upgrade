@@ -25,7 +25,7 @@ chmod +x 01-inventory.sh
 ```
 
 耗时**每个集群约 3–5 分钟**（40 项检查）。9 个集群请预留 40 分钟。
-执行期间屏幕上会打印 `[01]..[40]` 的进度，不是卡住。
+执行期间屏幕上会打印 `[01]..[47]` 的进度，不是卡住。
 
 ## 环境要求
 
@@ -72,12 +72,59 @@ inventory-<UTC日期>/
 tar czf inventory-<日期>.tar.gz inventory-<日期>
 ```
 
-**目录内容**：只有集群配置与版本信息（节点版本、Calico 配置、节点组参数、StorageClass、
-工作负载副本数与调度约束、NetworkPolicy 数量、addon 版本）。
+**目录内容**：集群配置与版本信息 —— 节点版本、Calico 配置、**节点组与启动模板全量配置**、
+StorageClass、工作负载副本数与调度约束、NetworkPolicy 数量、addon 版本。
 **不含** Secret、不含业务数据、不含 Pod 内容、不含镜像内容。
+
+### ⚠️ 关于 UserData（回传前请过一眼）
+
+为了能设计出"配置一致"的新节点组，脚本会把启动模板的 **UserData base64 解码后原文收录**。
+正常内容是 `bootstrap.sh` 的参数（集群名、apiserver endpoint、集群 CA 证书、
+`--kubelet-extra-args` 里的 labels/taints）—— 这些都不是机密，但**如果你们在 UserData 里
+写了自定义开机逻辑**（内网地址、token、私有仓库凭证等），它会一并出现在回传文件里。
+
+两个选择：
+
+```bash
+./01-inventory.sh --all --no-userdata    # 完全不采 UserData
+```
+或者照常采集，回传前检查这一节：
+
+```bash
+grep -A40 '启动模板 UserData' inventory-*/
+```
+
+不采 UserData 的代价：新节点组的开机逻辑要另外人工提供，否则只能复刻标准 bootstrap 参数。
 
 `MISSING.txt` 里有条目是正常的 —— 比如 `aws-node not found` 恰恰是"没装 vpc-cni"的证据。
 不必为它补跑，回传时带上即可。
+
+## 节点组与启动模板采了什么（设计新节点组用的）
+
+这是设计新节点组最关键的一组，共 7 项：
+
+| 采集项 | 内容 | 为什么需要 |
+|---|---|---|
+| 节点组完整配置 | `describe-nodegroup` **全量 JSON**，不裁字段 | scalingConfig / updateConfig / labels / taints / tags / subnets / remoteAccess / nodeRole 一个不漏 |
+| 启动模板 | 版本号信息 + **全量 `LaunchTemplateData`**（节点组钉的版本 与 `$Latest` 都采） | 🔴 LT 型节点组的 `instanceTypes`/`diskSize` 在 `describe-nodegroup` 里是 **null**，真值在 LT 里：卷大小/类型/IOPS/吞吐/加密、SG、IMDS（`HttpTokens`/`HopLimit`）、ImageId |
+| UserData | base64 解码后原文 | bootstrap 参数、`--kubelet-extra-args` 的 labels/taints、自定义开机逻辑 |
+| ASG 配置 | 混合实例策略、`InstancesDistribution`（按需/Spot 比例）、终止策略、挂起的流程、生命周期钩子、预热池 | 这些**不在**节点组字段里，新组若要行为一致必须单独复刻 |
+| 自管节点组检测 | 带本集群标签但不在托管 ASG 白名单里的 ASG | 🔴 自管组**不会**出现在 `list-nodegroups`。漏掉 ⇒ 升级方案阶段 B 整段不适用（托管用 `update-nodegroup-version`，自管要换 LT + 轮换 ASG） |
+| 节点实机与根卷 | 每节点的机型/AMI/AZ + 每个卷的大小/类型/IOPS/吞吐/**是否加密**/KMS key | 实际跑着的配置可能与 LT 不一致（LT 改过但节点没轮换）；加密与 KMS key 新组要对齐 |
+| AMI 详情 | AMI 名称/创建时间/**弃用时间**/架构 | 确认钉死的是哪个镜像、还有多久弃用 |
+
+### 一个实测到的坑（直接影响新节点组设计）
+
+同一个集群里两种建法的根卷默认值不同：
+
+| 节点组 | 建法 | 根卷实测 |
+|---|---|---|
+| LT 型（`amiType=CUSTOM`） | 自定义 LT 的 `BlockDeviceMappings` | **gp3 / 3000 IOPS / 125 吞吐** |
+| 托管 AMI 型 | `aws eks create-nodegroup --disk-size 30` | **gp2 / 100 IOPS**（EKS 默认 gp2！） |
+
+⇒ 用 `--managed-ami` 把 LT 型克隆成托管型时，**根卷会从 gp3 悄悄退回 gp2**。
+若要保持 gp3，新节点组仍得带一个只含 `BlockDeviceMappings` 的 LT。
+这一条请在看完采集结果后逐个节点组确认。
 
 ## summary.tsv 的列怎么看
 

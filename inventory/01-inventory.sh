@@ -15,6 +15,8 @@
 #    ./01-inventory.sh ctx-a ctx-b          # 采指定的若干 context
 #    ./01-inventory.sh --all                # 采 kubeconfig 里的全部 context
 #    ./01-inventory.sh --list               # 只列出可选 context，不采集
+#    ./01-inventory.sh --all --no-userdata  # 跳过启动模板 UserData 的解码采集
+#                                           #（UserData 里若有客户自定义敏感内容就加这个）
 #
 #  前提：
 #    · kubectl 可用、且对目标集群有只读权限（经 Rancher 代理访问也可以）
@@ -39,6 +41,19 @@ SUM="$OUT/summary.tsv"
 MISS="$OUT/MISSING.txt"
 
 # ── context 列表 ────────────────────────────────────────────────
+NO_USERDATA=0
+# 允许 --no-userdata 出现在任意位置：命中就摘掉它，其余参数照原样当 context 用
+_ARGS=""
+for _a in "$@"; do
+  case "$_a" in
+    --no-userdata) NO_USERDATA=1 ;;
+    *) _ARGS="${_ARGS:+$_ARGS }$_a" ;;
+  esac
+done
+# shellcheck disable=SC2086
+set -- $_ARGS
+export NO_USERDATA
+
 case "${1:-}" in
   --list)
     echo "kubeconfig 里的 context："
@@ -213,6 +228,118 @@ for CTX in $CTXS; do
         sh -c "for n in \$(aws eks list-nodegroups --region '$EKSREGION' --cluster-name '$EKSNAME' --query nodegroups --output text 2>/dev/null); do aws eks describe-nodegroup --region '$EKSREGION' --cluster-name '$EKSNAME' --nodegroup-name \$n --query 'nodegroup.[nodegroupName,version,releaseVersion,amiType,capacityType,instanceTypes[0],diskSize,scalingConfig.desiredSize,updateConfig.maxUnavailable,status,launchTemplate.id,nodeRole]' --output text; done"
     run "EKS 节点组的子网与标签/污点" \
         sh -c "for n in \$(aws eks list-nodegroups --region '$EKSREGION' --cluster-name '$EKSNAME' --query nodegroups --output text 2>/dev/null); do echo \"== \$n\"; aws eks describe-nodegroup --region '$EKSREGION' --cluster-name '$EKSNAME' --nodegroup-name \$n --query 'nodegroup.{subnets:subnets,labels:labels,taints:taints,tags:tags}'; done"
+    # ── G2. 节点组完整配置 + 启动模板 + ASG ─────────────────────
+    # 🔴 为什么要全量：LT 型节点组的 instanceTypes / diskSize 在 describe-nodegroup 里是 null，
+    #    真实值在**启动模板**里（卷类型/IOPS/吞吐/加密/KMS、UserData、SG、IMDS 配置）。
+    #    不采 LT 就设计不出"配置一致的新节点组"——克隆脚本也正是靠这些字段逐项继承。
+    run "节点组完整配置（JSON 全量，不做字段裁剪）" \
+        sh -c "for n in \$(aws eks list-nodegroups --region '$EKSREGION' --cluster-name '$EKSNAME' --query nodegroups --output text 2>/dev/null); do echo \"========== \$n ==========\"; aws eks describe-nodegroup --region '$EKSREGION' --cluster-name '$EKSNAME' --nodegroup-name \$n --output json; done"
+
+    run "启动模板：版本信息 + 全量 LaunchTemplateData（节点组钉的版本 与 \$Latest 都采）" \
+        sh -c '
+        for n in $(aws eks list-nodegroups --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --query nodegroups --output text 2>/dev/null); do
+          LTID=$(aws eks describe-nodegroup --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --nodegroup-name $n --query "nodegroup.launchTemplate.id" --output text 2>/dev/null)
+          LTVER=$(aws eks describe-nodegroup --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --nodegroup-name $n --query "nodegroup.launchTemplate.version" --output text 2>/dev/null)
+          echo "========== $n =========="
+          if [ "$LTID" = "None" ] || [ -z "$LTID" ]; then
+            echo "  无自定义启动模板（EKS 托管 AMI 节点组：机型/磁盘等直接在节点组字段上）"
+            continue
+          fi
+          echo "  launchTemplate: id=$LTID  节点组钉的版本=$LTVER"
+          aws ec2 describe-launch-templates --region "'"$EKSREGION"'" --launch-template-ids $LTID \
+            --query "LaunchTemplates[0].[LaunchTemplateName,DefaultVersionNumber,LatestVersionNumber,CreateTime]" --output text 2>&1
+          for v in "$LTVER" "\$Latest"; do
+            echo "  ---- LaunchTemplateData (version=$v) ----"
+            aws ec2 describe-launch-template-versions --region "'"$EKSREGION"'" --launch-template-id $LTID \
+              --versions "$v" --query "LaunchTemplateVersions[0].LaunchTemplateData" --output json 2>&1
+          done
+        done'
+
+    if [ "${NO_USERDATA:-0}" = 1 ]; then
+      printf '\n----- 启动模板 UserData -----\n已按 --no-userdata 跳过\n' >> "$F"
+    else
+      # UserData 必须解码才有用：里面是 bootstrap.sh 的参数（--kubelet-extra-args 的 labels/taints、
+      # --apiserver-endpoint、--b64-cluster-ca）以及客户自定义的开机逻辑。
+      # 新节点组若要"配置一致"，这些必须逐条复刻。
+      # ⚠️ UserData 是明文回传的一部分，里面**可能**含客户自定义的敏感内容 —— 见 README 的回传说明。
+      run "启动模板 UserData（已 base64 解码；如含敏感内容请用 --no-userdata 重跑）" \
+        sh -c '
+        for n in $(aws eks list-nodegroups --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --query nodegroups --output text 2>/dev/null); do
+          LTID=$(aws eks describe-nodegroup --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --nodegroup-name $n --query "nodegroup.launchTemplate.id" --output text 2>/dev/null)
+          LTVER=$(aws eks describe-nodegroup --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --nodegroup-name $n --query "nodegroup.launchTemplate.version" --output text 2>/dev/null)
+          [ "$LTID" = "None" ] || [ -z "$LTID" ] && continue
+          echo "========== $n (lt=$LTID v=$LTVER) =========="
+          UD=$(aws ec2 describe-launch-template-versions --region "'"$EKSREGION"'" --launch-template-id $LTID \
+                 --versions "$LTVER" --query "LaunchTemplateVersions[0].LaunchTemplateData.UserData" --output text 2>/dev/null)
+          [ "$UD" = "None" ] || [ -z "$UD" ] && { echo "  (无 UserData)"; continue; }
+          printf "%s" "$UD" | base64 --decode 2>/dev/null || printf "%s" "$UD" | base64 -D 2>/dev/null || echo "  (解码失败，原始 base64 见上一节)"
+        done'
+    fi
+
+    run "节点组背后的 ASG（混合实例策略/终止策略/挂起流程/生命周期钩子/预热池）" \
+        sh -c '
+        for n in $(aws eks list-nodegroups --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --query nodegroups --output text 2>/dev/null); do
+          ASG=$(aws eks describe-nodegroup --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --nodegroup-name $n --query "nodegroup.resources.autoScalingGroups[0].name" --output text 2>/dev/null)
+          [ "$ASG" = "None" ] || [ -z "$ASG" ] && continue
+          echo "========== $n -> $ASG =========="
+          aws autoscaling describe-auto-scaling-groups --region "'"$EKSREGION"'" --auto-scaling-group-names $ASG \
+            --query "AutoScalingGroups[0].{Min:MinSize,Max:MaxSize,Desired:DesiredCapacity,AZs:AvailabilityZones,MixedInstancesPolicy:MixedInstancesPolicy,TerminationPolicies:TerminationPolicies,SuspendedProcesses:SuspendedProcesses,HealthCheckType:HealthCheckType,HealthCheckGracePeriod:HealthCheckGracePeriod,CapacityRebalance:CapacityRebalance,Instances:length(Instances)}" --output json 2>&1
+          aws autoscaling describe-lifecycle-hooks --region "'"$EKSREGION"'" --auto-scaling-group-name $ASG \
+            --query "LifecycleHooks[].[LifecycleHookName,LifecycleTransition,HeartbeatTimeout,DefaultResult]" --output text 2>&1
+          aws autoscaling describe-warm-pool --region "'"$EKSREGION"'" --auto-scaling-group-name $ASG \
+            --query "WarmPoolConfiguration" --output json 2>&1
+        done'
+
+    # 🔴 自管节点组（用 ASG + 自己的 LT 拉起、不走 EKS 托管）**不会**出现在 list-nodegroups 里。
+    #    漏掉它 = 升级方案的「阶段 B」整段不适用（托管是 update-nodegroup-version，自管得换 LT + 轮换 ASG）。
+    # 🔴 自管节点组（用 ASG + 自己的 LT 拉起、不走 EKS 托管）**不会**出现在 list-nodegroups 里。
+    #    漏掉它 = 升级方案的「阶段 B」整段不适用（托管是 update-nodegroup-version，自管得换 LT + 轮换 ASG）。
+    #    判定方式：EKS 托管组的 ASG 一定能在 describe-nodegroup 的 resources.autoScalingGroups 里查到，
+    #    所以先把「托管 ASG 名」收集成白名单，白名单外的带本集群标签的 ASG 才是自管。
+    #    （不要拿 ASG 名去 grep 节点组名 —— 托管 ASG 名是 eks-<ng>-<uuid>，反向匹配会把托管组全误报成自管，踩过）
+    run "自管节点组检测：带本集群标签但不在托管 ASG 白名单里的 ASG" \
+        sh -c '
+        WL=""
+        for n in $(aws eks list-nodegroups --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --query nodegroups --output text 2>/dev/null); do
+          a=$(aws eks describe-nodegroup --region "'"$EKSREGION"'" --cluster-name "'"$EKSNAME"'" --nodegroup-name $n \
+                --query "nodegroup.resources.autoScalingGroups[].name" --output text 2>/dev/null)
+          WL="$WL $a"
+        done
+        echo "  托管 ASG 白名单:${WL:- <无托管节点组>}"
+        FOUND=0
+        aws autoscaling describe-auto-scaling-groups --region "'"$EKSREGION"'" \
+          --query "AutoScalingGroups[?Tags[?Key==\`kubernetes.io/cluster/'"$EKSNAME"'\`]].[AutoScalingGroupName,MinSize,MaxSize,DesiredCapacity,LaunchTemplate.LaunchTemplateName,MixedInstancesPolicy.LaunchTemplate.LaunchTemplateSpecification.LaunchTemplateName]" \
+          --output text 2>&1 | while IFS=$(printf "\t") read -r name mn mx ds lt1 lt2; do
+            [ -z "$name" ] && continue
+            case " $WL " in
+              *" $name "*) echo "  [托管] $name" ;;
+              *) echo "  🔴 [自管-需单独规划] $name min=$mn max=$mx desired=$ds lt=${lt1}${lt2}" ;;
+            esac
+          done
+        echo "  —— 若上面出现 🔴，升级方案的阶段 B（节点组升级）对该组不适用，需改 LT + 轮换 ASG"'
+
+    run "节点实机与根卷（机型/AMI/卷大小/类型/IOPS/吞吐/加密）" \
+        sh -c '
+        for i in $(aws ec2 describe-instances --region "'"$EKSREGION"'" \
+              --filters "Name=tag:kubernetes.io/cluster/'"$EKSNAME"',Values=owned,shared" "Name=instance-state-name,Values=running" \
+              --query "Reservations[].Instances[].InstanceId" --output text 2>/dev/null); do
+          aws ec2 describe-instances --region "'"$EKSREGION"'" --instance-ids $i \
+            --query "Reservations[0].Instances[0].[InstanceId,InstanceType,ImageId,Placement.AvailabilityZone,Tags[?Key==\`eks:nodegroup-name\`].Value|[0]]" --output text 2>&1
+          aws ec2 describe-volumes --region "'"$EKSREGION"'" \
+            --filters "Name=attachment.instance-id,Values=$i" \
+            --query "Volumes[].[VolumeId,Size,VolumeType,Iops,Throughput,Encrypted,KmsKeyId,Attachments[0].Device]" --output text 2>&1
+        done'
+
+    run "节点组用到的 AMI 详情（确认钉的是哪个镜像、是否已弃用）" \
+        sh -c '
+        IDS=$(aws ec2 describe-instances --region "'"$EKSREGION"'" \
+          --filters "Name=tag:kubernetes.io/cluster/'"$EKSNAME"',Values=owned,shared" "Name=instance-state-name,Values=running" \
+          --query "Reservations[].Instances[].ImageId" --output text 2>/dev/null | tr "\t" "\n" | sort -u)
+        for a in $IDS; do
+          aws ec2 describe-images --region "'"$EKSREGION"'" --image-ids $a \
+            --query "Images[0].[ImageId,Name,CreationDate,DeprecationTime,Architecture,RootDeviceType]" --output text 2>&1
+        done'
+
     run "EKS 升级前置检查 insights" aws eks list-insights --region "$EKSREGION" --cluster-name "$EKSNAME" \
         --query 'insights[].{name:name,status:insightStatus.status,cat:category}' --output table
     run "子网空闲 IP（控制面升级与新建节点组都要占 IP）" \
